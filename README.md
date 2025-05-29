@@ -4,18 +4,18 @@ A high-performance, multi-format content caching solution designed for efficient
 
 ## Features
 
-- 🚀 **High Performance**: Sub-millisecond retrieval for cached content
-- 📁 **Multi-Format Support**: Handles PDF, Markdown, Text, and extensible to other formats
-- 🔍 **Smart Change Detection**: SHA-256 hashing with modification time tracking
+- **High Performance**: Sub-millisecond retrieval for cached content
+- **Multi-Format Support**: Handles PDF, Markdown, Text, and extensible to other formats
+- **Smart Change Detection**: SHA-256 hashing with modification time tracking
 - **Hybrid Storage**: In-memory LRU cache + SQLite persistence + compressed file storage
-- 🔌 **Pluggable Processors**: Use custom content extraction functions via callbacks
-- 🔒 **Thread-Safe**: Concurrent access support with proper locking mechanisms
+- **Pluggable Processors**: Use custom content extraction functions via callbacks
+- **Thread-Safe**: Concurrent access support with proper locking mechanisms
 - **Deduplication**: Automatically detects and handles duplicate files
-- 🛡️ **Integrity Checks**: Multi-level verification ensures data consistency
+- **Integrity Checks**: Multi-level verification ensures data consistency
 - **Smart Re-download Detection**: Recognizes identical content in re-downloaded files
-- 📈 **Comprehensive Metrics**: Built-in performance monitoring with Prometheus export
-- 🔐 **Security Features**: Path validation and traversal attack prevention
-- ⚡ **Batch Processing**: Concurrent processing with configurable limits
+- **Comprehensive Metrics**: Built-in performance monitoring with Prometheus export
+- **Security Features**: Path validation and traversal attack prevention
+- **Batch Processing**: Concurrent processing with configurable limits
 
 ## Installation
 
