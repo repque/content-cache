@@ -27,12 +27,6 @@ cd content-file-cache
 pip install -e .
 ```
 
-For the PDF processing examples, also install:
-
-```bash
-pip install PyPDF2 aiohttp aiofiles
-```
-
 ## Quick Start: PDF Processing Example
 
 This example shows how to download and process multiple PDF files with caching:
@@ -751,7 +745,7 @@ Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md)
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the Apache License - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
@@ -761,6 +755,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Support
 
-- 📧 Email: support@example.com
-- 💬 Discord: [Join our community](https://discord.gg/example)
-- 🐛 Issues: [GitHub Issues](https://github.com/yourusername/content-file-cache/issues)
+- 📧 Email: repque@gmail.com
+- 🐛 Issues: [GitHub Issues](https://github.com/repque/content-file-cache/issues)
