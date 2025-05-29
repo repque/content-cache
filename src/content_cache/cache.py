@@ -6,7 +6,7 @@ import logging
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from pybloom_live import BloomFilter
 
@@ -116,7 +116,7 @@ class ContentCache:
     async def get_content(
         self,
         file_path: Path,
-        process_callback: Callable[[Path], str]
+        process_callback: Callable[[Path], Awaitable[str]]
     ) -> CachedContent:
         """
         Get content from cache or process file if needed.
@@ -234,6 +234,14 @@ class ContentCache:
         # Verify integrity
         integrity_status = await self.integrity_checker.check_integrity(cached_entry)
         if integrity_status == IntegrityStatus.VALID:
+            # Check if we need to update modification time in memory cache
+            current_stat = file_path.stat()
+            if current_stat.st_mtime > cached_entry.modification_time:
+                # Update cached entry with new mtime
+                cached_entry.modification_time = current_stat.st_mtime
+                cached_entry.last_accessed = datetime.now()
+                # Note: Memory cache entry will be updated automatically since we're modifying the object
+            
             return CachedContent(
                 content=cached_entry.content,
                 from_cache=True,
@@ -269,7 +277,15 @@ class ContentCache:
 
         # Verify integrity
         integrity_status = await self.integrity_checker.check_integrity(cached_entry)
-        if integrity_status != IntegrityStatus.VALID:
+        if integrity_status == IntegrityStatus.VALID:
+            # Check if we need to update modification time
+            current_stat = file_path.stat()
+            if current_stat.st_mtime > cached_entry.modification_time:
+                # File has newer mtime but same content - update cached mtime
+                cached_entry.modification_time = current_stat.st_mtime
+                cached_entry.last_accessed = datetime.now()
+                await self.sqlite_storage.add(cached_entry)  # Update in database
+        elif integrity_status != IntegrityStatus.VALID:
             return None
 
         # Load content from blob storage if needed
@@ -322,7 +338,7 @@ class ContentCache:
     async def _process_and_cache(
         self,
         file_path: Path,
-        process_callback: Callable[[Path], str]
+        process_callback: Callable[[Path], Awaitable[str]]
     ) -> CachedContent:
         """
         Process file and store in cache.
@@ -410,7 +426,7 @@ class ContentCache:
     async def get_content_batch(
         self,
         file_paths: Sequence[Path],
-        process_callback: Callable[[Path], str],
+        process_callback: Callable[[Path], Awaitable[str]],
         max_concurrent: int = 10
     ) -> list[CachedContent]:
         """

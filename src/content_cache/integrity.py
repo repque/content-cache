@@ -78,9 +78,21 @@ class FileIntegrityChecker:
 
         # Check modification time
         if stat.st_mtime > entry.modification_time:
-            return IntegrityStatus.FILE_MODIFIED
+            # File was modified - but check if content actually changed
+            if self.verify_hash:
+                current_hash = await self._compute_file_hash(entry.file_path)
+                if current_hash == entry.content_hash:
+                    # Content unchanged despite new mtime (e.g., re-downloaded same file)
+                    # This is still valid, but we'll need to update the mtime in cache
+                    return IntegrityStatus.VALID
+                else:
+                    # Content actually changed
+                    return IntegrityStatus.CONTENT_CHANGED
+            else:
+                # Without hash verification, assume file was modified
+                return IntegrityStatus.FILE_MODIFIED
 
-        # Level 2: Hash verification (if enabled)
+        # Level 2: Hash verification (if enabled and mtime unchanged)
         if self.verify_hash:
             current_hash = await self._compute_file_hash(entry.file_path)
             if current_hash != entry.content_hash:

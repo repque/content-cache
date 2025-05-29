@@ -7,11 +7,15 @@ A high-performance, multi-format content caching solution designed for efficient
 - 🚀 **High Performance**: Sub-millisecond retrieval for cached content
 - 📁 **Multi-Format Support**: Handles PDF, Markdown, Text, and extensible to other formats
 - 🔍 **Smart Change Detection**: SHA-256 hashing with modification time tracking
-- 💾 **Hybrid Storage**: In-memory LRU cache + SQLite persistence + compressed file storage
+- **Hybrid Storage**: In-memory LRU cache + SQLite persistence + compressed file storage
 - 🔌 **Pluggable Processors**: Use custom content extraction functions via callbacks
 - 🔒 **Thread-Safe**: Concurrent access support with proper locking mechanisms
-- 📊 **Deduplication**: Automatically detects and handles duplicate files
+- **Deduplication**: Automatically detects and handles duplicate files
 - 🛡️ **Integrity Checks**: Multi-level verification ensures data consistency
+- **Smart Re-download Detection**: Recognizes identical content in re-downloaded files
+- 📈 **Comprehensive Metrics**: Built-in performance monitoring with Prometheus export
+- 🔐 **Security Features**: Path validation and traversal attack prevention
+- ⚡ **Batch Processing**: Concurrent processing with configurable limits
 
 ## Installation
 
@@ -22,11 +26,16 @@ pip install content-file-cache
 Or install from source:
 
 ```bash
-git clone https://github.com/yourusername/content-file-cache.git
-cd content-file-cache
+git clone https://github.com/repque/content-cache.git
+cd content-cache
 pip install -e .
 ```
 
+For the PDF processing examples with Anthropic's API, also install:
+
+```bash
+pip install anthropic aiohttp aiofiles
+```
 ## Simple Usage
 
 For basic usage without downloads:
@@ -36,8 +45,8 @@ import asyncio
 from pathlib import Path
 from content_cache import ContentCache, CacheConfig
 
-# Define your content processor
-def process_pdf(file_path: Path) -> str:
+# Define your content processor (must be async)
+async def process_pdf(file_path: Path) -> str:
     # Your PDF extraction logic here
     return f"Extracted content from {file_path.name}"
 
@@ -62,6 +71,224 @@ async def main():
 asyncio.run(main())
 ```
 
+## Real-World Example: Transaction Extraction with Anthropic API
+
+Here's a production-ready example that shows how to use the cache with expensive API calls:
+
+```python
+import asyncio
+import json
+import base64
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Optional
+import anthropic
+
+from content_cache import ContentCache, CacheConfig
+
+
+class TransactionExtractor:
+    """Extract financial transactions from PDFs using Anthropic's Claude API."""
+    
+    def __init__(self, api_key: str, cache_dir: Path = Path("./transaction_cache")):
+        # Initialize Anthropic client
+        self.client = anthropic.Anthropic(api_key=api_key)
+        
+        # Configure cache for API responses
+        config = CacheConfig(
+            cache_dir=cache_dir,
+            max_memory_size=500 * 1024 * 1024,  # 500MB
+            verify_hash=True,  # Ensure data integrity
+            compression_level=6,  # JSON compresses well
+            # Optional: restrict to specific directories for security
+            allowed_paths=[Path("./uploads"), Path("./documents")]
+        )
+        
+        self.cache = ContentCache(config=config)
+        self.stats = {
+            'api_calls_made': 0,
+            'api_calls_saved': 0,
+            'total_cost_saved': 0.0
+        }
+    
+    async def extract_transactions(self, pdf_path: Path) -> str:
+        """Extract transactions from PDF using Claude API.
+        
+        This is the expensive operation we want to cache.
+        Cost: ~$0.015 per page with Claude-3-Opus
+        """
+        print(f"\nCalling Anthropic API for {pdf_path.name}...")
+        self.stats['api_calls_made'] += 1
+        
+        # Read and encode PDF
+        with open(pdf_path, 'rb') as f:
+            pdf_data = f.read()
+            pdf_base64 = base64.b64encode(pdf_data).decode('utf-8')
+        
+        # Calculate approximate cost
+        file_size_mb = len(pdf_data) / (1024 * 1024)
+        estimated_pages = max(1, int(file_size_mb * 4))
+        estimated_cost = estimated_pages * 0.015
+        
+        # Call Claude API
+        try:
+            message = self.client.messages.create(
+                model="claude-3-opus-20240229",
+                max_tokens=4096,
+                temperature=0,  # Deterministic for caching
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": """Analyze this financial document and extract ALL transactions.
+                                
+                                For each transaction, extract:
+                                - date (ISO format: YYYY-MM-DD)
+                                - description
+                                - amount (as float, negative for debits)
+                                - type ("debit" or "credit")
+                                - category (best guess: groceries, utilities, salary, etc.)
+                                - merchant (if identifiable)
+                                
+                                Return ONLY a JSON array of transactions, no other text.
+                                
+                                Example format:
+                                [
+                                  {
+                                    "date": "2024-01-15",
+                                    "description": "WHOLE FOODS MARKET",
+                                    "amount": -127.43,
+                                    "type": "debit",
+                                    "category": "groceries",
+                                    "merchant": "Whole Foods"
+                                  }
+                                ]"""
+                            },
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": pdf_base64
+                                }
+                            }
+                        ]
+                    }
+                ]
+            )
+            
+            result = message.content[0].text
+            
+            # Validate JSON
+            transactions = json.loads(result)
+            
+            print(f"Extracted {len(transactions)} transactions (cost: ~${estimated_cost:.3f})")
+            return json.dumps(transactions, indent=2)
+            
+        except Exception as e:
+            print(f"API Error: {str(e)}")
+            return json.dumps({"error": str(e), "timestamp": datetime.now().isoformat()})
+    
+    async def process_statements(self, pdf_paths: List[Path], max_concurrent: int = 2) -> Dict[str, any]:
+        """Process multiple bank statements with caching.
+        
+        Args:
+            pdf_paths: List of PDF files to process
+            max_concurrent: Max concurrent API calls (respect rate limits)
+        """
+        print(f"\nProcessing {len(pdf_paths)} PDF files...")
+        print(f"Cache enabled at: {self.cache.config.cache_dir}\n")
+        
+        results = {}
+        
+        # Process files
+        for pdf_path in pdf_paths:
+            # This will use cache if available, otherwise call extract_transactions
+            start_time = asyncio.get_event_loop().time()
+            
+            cache_result = await self.cache.get_content(
+                pdf_path,
+                self.extract_transactions
+            )
+            
+            elapsed = asyncio.get_event_loop().time() - start_time
+            
+            # Track savings
+            if cache_result.from_cache:
+                self.stats['api_calls_saved'] += 1
+                # Estimate cost saved
+                file_size = pdf_path.stat().st_size / (1024 * 1024)
+                pages = max(1, int(file_size * 4))
+                self.stats['total_cost_saved'] += pages * 0.015
+            
+            # Parse results
+            try:
+                transactions = json.loads(cache_result.content)
+                results[pdf_path.name] = {
+                    'transactions': transactions,
+                    'count': len(transactions) if isinstance(transactions, list) else 0,
+                    'from_cache': cache_result.from_cache,
+                    'processing_time': elapsed,
+                    'file_hash': cache_result.content_hash[:16]
+                }
+                
+                status = "CACHED" if cache_result.from_cache else "PROCESSED"
+                print(f"{status} {pdf_path.name}: {results[pdf_path.name]['count']} transactions ({elapsed:.2f}s)")
+                
+            except json.JSONDecodeError:
+                results[pdf_path.name] = {
+                    'error': 'Failed to parse response',
+                    'from_cache': cache_result.from_cache
+                }
+        
+        # Print statistics
+        print(f"\nCache Performance:")
+        print(f"   - API calls made: {self.stats['api_calls_made']}")
+        print(f"   - API calls saved: {self.stats['api_calls_saved']}")
+        print(f"   - Estimated cost saved: ${self.stats['total_cost_saved']:.2f}")
+        
+        cache_stats = await self.cache.get_statistics()
+        print(f"   - Cache hit rate: {cache_stats['hit_rate']:.1%}")
+        print(f"   - Memory usage: {cache_stats['memory_usage_mb']:.1f} MB")
+        
+        return results
+    
+    async def close(self):
+        """Clean up resources."""
+        await self.cache.close()
+
+
+# Example usage
+async def main():
+    # Initialize extractor
+    extractor = TransactionExtractor(
+        api_key="your-anthropic-api-key",
+        cache_dir=Path("./transaction_cache")
+    )
+    
+    # Process bank statements
+    pdf_files = [
+        Path("./statements/checking_jan_2024.pdf"),
+        Path("./statements/checking_feb_2024.pdf"),
+        Path("./statements/credit_card_jan_2024.pdf"),
+    ]
+    
+    # First run - will call API
+    print("=== FIRST RUN (API CALLS) ===")
+    results = await extractor.process_statements(pdf_files)
+    
+    # Second run - will use cache (instant!)
+    print("\n\n=== SECOND RUN (CACHED) ===")
+    results = await extractor.process_statements(pdf_files)
+    
+    await extractor.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
 ### Key Benefits of Caching API Calls:
 
 1. **Cost Savings**: Each Claude API call costs ~$0.015 per page. Cache saves money on repeated processing.
@@ -69,6 +296,7 @@ asyncio.run(main())
 3. **Rate Limit Protection**: Reduce API calls to stay within rate limits
 4. **Reliability**: Continue working even if API is temporarily unavailable
 5. **Development**: Test your code without burning through API credits
+6. **Smart Re-download Detection**: Cache recognizes when re-downloaded files have identical content and serves from cache
 
 ## Usage Examples
 
@@ -123,57 +351,9 @@ for result in results:
 # Output shows doc1.pdf and doc1_copy.pdf have same hash
 ```
 
-### Cache Management
+## Advanced Configuration
 
-```python
-# Get cache statistics
-stats = await cache.get_statistics()
-print(f"Hit rate: {stats['hit_rate']:.2%}")
-print(f"Duplicate groups: {stats['duplicate_groups']}")
-
-# Invalidate specific file
-await cache.invalidate(Path("old_file.pdf"))
-
-# Invalidate multiple files
-files_to_remove = [Path("old1.pdf"), Path("old2.pdf")]
-removed_count = await cache.invalidate_batch(files_to_remove)
-
-# Clear old entries (based on last access time)
-removed = await cache.clear_old_entries(days=30)
-print(f"Removed {removed} stale entries")
-
-# Get Prometheus metrics
-prometheus_metrics = cache.get_metrics_prometheus()
-print(prometheus_metrics)
-```
-
-## Configuration
-
-```python
-from content_cache import ContentCache, CacheConfig
-
-# Method 1: Direct configuration
-config = CacheConfig(
-    cache_dir=Path("./cache_storage"),
-    max_memory_size=100 * 1024 * 1024,  # 100MB
-    verify_hash=True,
-    db_pool_size=10,
-    compression_level=6,
-    bloom_filter_size=1000000,
-    debug=False,
-    allowed_paths=[Path("/safe/directory")]  # Security: restrict file access
-)
-cache = ContentCache(config=config)
-
-# Method 2: Environment variables (see Environment Configuration section)
-# Set CACHE_DIR=/path/to/cache, MAX_MEMORY_SIZE=104857600, etc.
-config = CacheConfig()  # Reads from environment
-cache = ContentCache(config=config)
-```
-
-## Advanced Usage
-
-### Environment Configuration
+### Environment Variables
 
 All configuration can be set via environment variables:
 
@@ -206,16 +386,65 @@ except CachePermissionError:
     print("Access denied to file outside allowed paths")
 ```
 
-### Batch Processing
+### Performance Tuning
 
 ```python
-# Process multiple files efficiently
-files = [Path(f"doc{i}.pdf") for i in range(100)]
-results = await cache.get_content_batch(
-    files, 
-    process_pdf, 
-    max_concurrent=10  # Limit concurrent processing
+from content_cache import ContentCache, CacheConfig
+
+# High-performance configuration
+config = CacheConfig(
+    cache_dir=Path("./cache"),
+    max_memory_size=500 * 1024 * 1024,  # 500MB for large datasets
+    verify_hash=True,  # Enable for data integrity
+    db_pool_size=20,  # Increase for high concurrency
+    compression_level=9,  # Max compression for storage efficiency
+    bloom_filter_size=10000000,  # Large bloom filter for better performance
+    debug=False  # Disable for production
 )
+```
+
+### Cache Management
+
+```python
+# Get cache statistics
+stats = await cache.get_statistics()
+print(f"Hit rate: {stats['hit_rate']:.2%}")
+print(f"Duplicate groups: {stats['duplicate_groups']}")
+
+# Invalidate specific file
+await cache.invalidate(Path("old_file.pdf"))
+
+# Invalidate multiple files
+files_to_remove = [Path("old1.pdf"), Path("old2.pdf")]
+removed_count = await cache.invalidate_batch(files_to_remove)
+
+# Clear old entries (based on last access time)
+removed = await cache.clear_old_entries(days=30)
+print(f"Removed {removed} stale entries")
+
+# Get Prometheus metrics
+prometheus_metrics = cache.get_metrics_prometheus()
+print(prometheus_metrics)
+```
+
+## More Examples
+
+Check out the `examples/` directory for complete, runnable examples:
+
+- **`simple_usage.py`** - Basic usage with text file processing
+- **`pdf_transaction_extraction.py`** - Real-world example using Anthropic's API to extract transactions from bank statements
+- **`redownload_test.py`** - Demonstrates smart re-download detection
+
+```bash
+# Run the simple example
+python examples/simple_usage.py
+
+# Run the PDF processing example (requires Anthropic API key)
+export ANTHROPIC_API_KEY="your-api-key"
+python examples/pdf_transaction_extraction.py
+
+# Test re-download detection
+python examples/redownload_test.py
 ```
 
 ## API Reference
@@ -287,29 +516,6 @@ Benchmark results on typical workload:
 | Hash computation | 5-20ms | For 10MB file |
 | Duplicate detection | <1ms | Hash lookup |
 
-## Comparison with Redis
-
-Wondering how this compares to Redis? See our detailed [Redis Comparison Guide](docs/REDIS_COMPARISON.md) for:
-- Architecture differences
-- Performance characteristics  
-- Use case analysis
-- When to use each solution
-
-## More Examples
-
-Check out the `examples/` directory for complete, runnable examples:
-
-- **`simple_usage.py`** - Basic usage with text file processing
-- **`pdf_transaction_extraction.py`** - Real-world example using Anthropic's API to extract transactions from bank statements
-
-```bash
-# Run the simple example
-python examples/simple_usage.py
-
-# Run the PDF processing example (requires Anthropic API key)
-export ANTHROPIC_API_KEY="your-api-key"
-python examples/pdf_transaction_extraction.py
-```
 
 ## Contributing
 
@@ -327,5 +533,5 @@ This project is licensed under the Apache License - see the [LICENSE](LICENSE) f
 
 ## Support
 
-- 📧 Email: repque@gmail.com
-- 🐛 Issues: [GitHub Issues](https://github.com/repque/content-file-cache/issues)
+- Email: repque@gmail.com
+- Issues: [GitHub Issues](https://github.com/repque/content-file-cache/issues)
