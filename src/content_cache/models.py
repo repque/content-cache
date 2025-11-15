@@ -12,12 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 class IntegrityStatus(str, Enum):
     """
     Enum representing file integrity check results.
-    
+
     Intent:
     Provides a type-safe way to represent the outcome of file integrity
     verification. Rather than using magic strings or boolean flags, this enum
     makes the code more readable and helps catch errors at development time.
-    
+
     Each status indicates a specific condition that affects whether cached
     content can be trusted or needs to be regenerated.
     """
@@ -32,18 +32,18 @@ class IntegrityStatus(str, Enum):
 class CacheEntry(BaseModel):
     """
     Represents a single entry in the cache with all metadata.
-    
+
     Intent:
     This is the core data structure that tracks everything needed to manage
     cached file content. It serves as both the in-memory representation and
     the schema for persistent storage.
-    
+
     Key design decisions:
     - Includes both content and blob path to support hybrid storage
     - Tracks access patterns (count, last_accessed) for LRU eviction
     - Uses Pydantic for validation and serialization consistency
     - Supports both string and Path inputs for flexibility
-    
+
     The entry contains enough metadata to:
     - Verify content freshness (modification_time, content_hash)
     - Implement cache eviction policies (access_count, last_accessed)
@@ -70,13 +70,13 @@ class CacheEntry(BaseModel):
     def validate_file_path(cls, v: Any) -> Path:
         """
         Ensure file_path is a Path object.
-        
+
         Intent:
         Provides flexible input handling while maintaining type safety internally.
         Users can pass either string paths or Path objects, but internally we
         always work with Path objects for consistency and to leverage Path's
         rich API (exists(), stat(), etc.).
-        
+
         This validation happens before other Pydantic validation, ensuring
         downstream code can always assume file_path is a proper Path object.
         """
@@ -91,13 +91,13 @@ class CacheEntry(BaseModel):
     def validate_content_blob_path(cls, v: Any) -> Optional[Path]:
         """
         Ensure content_blob_path is a Path object if provided.
-        
+
         Intent:
         Similar to file_path validation but handles the optional nature of
         blob paths. Small content is stored directly in the database with
         content_blob_path=None, while large content is stored as compressed
         blobs with the path recorded here.
-        
+
         This dual approach optimizes for query performance (small content) and
         storage efficiency (large content compression).
         """
@@ -113,12 +113,12 @@ class CacheEntry(BaseModel):
     def serialize_path(self, path: Optional[Path]) -> Optional[str]:
         """
         Serialize Path objects to strings.
-        
+
         Intent:
         Ensures Path objects are properly serialized when the model is converted
         to JSON or stored in databases. Path objects aren't natively JSON-serializable,
         so we convert them to strings for persistence and API responses.
-        
+
         This serializer maintains cross-platform compatibility by using string
         representation rather than attempting to preserve Path object state.
         """
@@ -128,18 +128,18 @@ class CacheEntry(BaseModel):
 class CachedContent(BaseModel):
     """
     Response model for cached content retrieval.
-    
+
     Intent:
     This is the public-facing response model returned by the cache's get_content
     method. It provides everything a client needs to understand the result:
     the actual content plus metadata about its source and characteristics.
-    
+
     Key design decisions:
     - Separates public API from internal storage model (CacheEntry)
     - Includes from_cache flag for performance monitoring
     - Provides content hash for client-side verification if needed
     - Includes extraction timestamp for freshness assessment
-    
+
     The model helps clients make informed decisions about content usage,
     understand cache performance, and implement their own caching strategies
     if needed.

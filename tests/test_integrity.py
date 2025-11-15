@@ -92,7 +92,7 @@ class TestFileIntegrityChecker:
         # Mock the hash computation to return expected hash
         checker = FileIntegrityChecker(verify_hash=True)
         
-        with patch.object(checker, '_compute_file_hash', 
+        with patch.object(checker, 'compute_file_hash', 
                          return_value="abc123def456789"):
             status = await checker.check_integrity(sample_cache_entry)
             assert status == IntegrityStatus.VALID
@@ -105,19 +105,19 @@ class TestFileIntegrityChecker:
         checker = FileIntegrityChecker(verify_hash=True)
         
         # Mock hash computation to return different hash
-        with patch.object(checker, '_compute_file_hash', 
+        with patch.object(checker, 'compute_file_hash', 
                          return_value="different_hash"):
             status = await checker.check_integrity(sample_cache_entry)
             assert status == IntegrityStatus.CONTENT_CHANGED
 
     @pytest.mark.asyncio
-    async def test_compute_file_hash(self, temp_file):
+    async def testcompute_file_hash(self, temp_file):
         """
         Test actual file hash computation
         """
         checker = FileIntegrityChecker(verify_hash=True)
-        hash1 = await checker._compute_file_hash(temp_file)
-        hash2 = await checker._compute_file_hash(temp_file)
+        hash1 = await checker.compute_file_hash(temp_file)
+        hash2 = await checker.compute_file_hash(temp_file)
         
         # Same file should produce same hash
         assert hash1 == hash2
@@ -125,7 +125,7 @@ class TestFileIntegrityChecker:
         assert len(hash1) == 64  # SHA-256 produces 64 character hex string
 
     @pytest.mark.asyncio
-    async def test_compute_file_hash_large_file(self):
+    async def testcompute_file_hash_large_file(self):
         """
         Test hash computation for large files
         """
@@ -137,7 +137,7 @@ class TestFileIntegrityChecker:
         
         try:
             checker = FileIntegrityChecker(verify_hash=True)
-            hash_result = await checker._compute_file_hash(large_file)
+            hash_result = await checker.compute_file_hash(large_file)
             assert isinstance(hash_result, str)
             assert len(hash_result) == 64
         finally:

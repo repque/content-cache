@@ -11,6 +11,7 @@ from .exceptions import (
     CacheProcessingError,
     CacheStorageError,
 )
+from .interfaces import IBlobStorage, IIntegrityChecker, IStorage
 from .models import CachedContent, CacheEntry, IntegrityStatus
 
 __version__ = "0.1.0"
@@ -20,6 +21,9 @@ __all__ = [
     "CachedContent",
     "CacheEntry",
     "IntegrityStatus",
+    "IStorage",
+    "IBlobStorage",
+    "IIntegrityChecker",
     "CacheError",
     "CacheCorruptionError",
     "CacheStorageError",

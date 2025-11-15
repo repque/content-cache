@@ -3,10 +3,10 @@ Main ContentCache implementation
 """
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Callable, Optional
 
 from pybloom_live import BloomFilter
 
@@ -14,6 +14,7 @@ from .config import CacheConfig
 from .exceptions import CachePermissionError
 from .file_storage import FileStorage
 from .integrity import FileIntegrityChecker
+from .interfaces import IBlobStorage, IIntegrityChecker, IStorage
 from .memory_cache import MemoryCache
 from .metrics import CacheMetrics, MetricsCollector
 from .models import CachedContent, CacheEntry, IntegrityStatus
@@ -25,18 +26,18 @@ logger = logging.getLogger(__name__)
 class ContentCache:
     """
     High-performance content cache with multi-tier storage.
-    
+
     Intent:
     This class orchestrates a sophisticated caching system designed to eliminate
     redundant file processing operations. By maintaining multiple storage tiers
     (memory, SQLite, compressed blobs) and intelligent change detection, it ensures
     that file content extraction only happens when absolutely necessary.
-    
+
     The cache operates on the principle that file processing (especially for formats
     like PDF) is expensive, but content rarely changes. By tracking file hashes and
     modification times, we can serve cached results with sub-millisecond latency
     while guaranteeing freshness.
-    
+
     Key Design Decisions:
     - Multi-tier storage balances speed vs capacity
     - Async architecture supports high concurrency
@@ -45,29 +46,44 @@ class ContentCache:
     - Content hashing enables deduplication across file paths
     """
 
-    def __init__(self, config: Optional[CacheConfig] = None):
+    def __init__(
+        self,
+        config: Optional[CacheConfig] = None,
+        storage: Optional[IStorage] = None,
+        blob_storage: Optional[IBlobStorage] = None,
+        integrity_checker: Optional[IIntegrityChecker] = None
+    ):
         """
         Initialize content cache with configuration.
-        
+
         Intent:
         Sets up the cache infrastructure without performing any I/O operations.
         This lazy initialization pattern allows the cache to be created quickly
         and initialized only when first used, supporting dependency injection
         and testing scenarios.
-        
+
+        Supports dependency injection of storage implementations through interfaces,
+        enabling easy testing with mocks and alternative storage backends.
+
         Args:
             config: Cache configuration object. If None, uses sensible defaults.
                    Allows customization of storage paths, memory limits, and
                    performance tuning parameters.
+            storage: Optional IStorage implementation. If None, uses SQLiteStorage.
+            blob_storage: Optional IBlobStorage implementation. If None, uses FileStorage.
+            integrity_checker: Optional IIntegrityChecker implementation. If None,
+                             uses FileIntegrityChecker.
         """
         self.config = config or CacheConfig()
         self._initialized = False
 
-        # Components
+        # Components - interfaces for dependency injection
         self.memory_cache = MemoryCache(self.config.max_memory_size)
-        self.sqlite_storage: Optional[SQLiteStorage] = None
-        self.file_storage: Optional[FileStorage] = None
-        self.integrity_checker = FileIntegrityChecker(self.config.verify_hash)
+        self._storage: Optional[IStorage] = storage
+        self._blob_storage: Optional[IBlobStorage] = blob_storage
+        self._integrity_checker: IIntegrityChecker = (
+            integrity_checker or FileIntegrityChecker(self.config.verify_hash)
+        )
 
         # Bloom filter for negative cache (non-existent files)
         self.bloom_filter = BloomFilter(
@@ -82,18 +98,33 @@ class ContentCache:
         self._processing_locks: dict[Path, asyncio.Lock] = {}
         self._lock_manager = asyncio.Lock()
 
+    @property
+    def sqlite_storage(self) -> Optional[IStorage]:
+        """Backward compatibility property for storage access."""
+        return self._storage
+
+    @property
+    def file_storage(self) -> Optional[IBlobStorage]:
+        """Backward compatibility property for blob storage access."""
+        return self._blob_storage
+
+    @property
+    def integrity_checker(self) -> IIntegrityChecker:
+        """Backward compatibility property for integrity checker access."""
+        return self._integrity_checker
+
     async def initialize(self) -> None:
         """
         Initialize all cache components.
-        
+
         Intent:
         Performs the actual setup of storage components that require I/O operations.
         This includes creating the cache directory structure, initializing the
         SQLite database with proper schema, and setting up blob storage.
-        
+
         Called automatically on first cache access to ensure components are ready.
         Idempotent - safe to call multiple times.
-        
+
         Raises:
             CacheStorageError: If unable to create cache directory or initialize storage
         """
@@ -103,13 +134,15 @@ class ContentCache:
         # Ensure cache directory exists
         self.config.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Initialize storage components
-        db_path = self.config.cache_dir / "cache.db"
-        self.sqlite_storage = SQLiteStorage(db_path, self.config.db_pool_size)
-        await self.sqlite_storage.initialize()
+        # Initialize storage components if not injected
+        if self._storage is None:
+            db_path = self.config.cache_dir / "cache.db"
+            self._storage = SQLiteStorage(db_path, self.config.db_pool_size)
+        await self._storage.initialize()
 
-        blob_dir = self.config.cache_dir / "blobs"
-        self.file_storage = FileStorage(blob_dir, self.config.compression_level)
+        if self._blob_storage is None:
+            blob_dir = self.config.cache_dir / "blobs"
+            self._blob_storage = FileStorage(blob_dir, self.config.compression_level)
 
         self._initialized = True
 
@@ -120,26 +153,26 @@ class ContentCache:
     ) -> CachedContent:
         """
         Get content from cache or process file if needed.
-        
+
         Intent:
         This is the primary cache interface that implements the core caching logic.
         It follows a cascading lookup strategy: memory → SQLite → blob storage,
         only falling back to expensive file processing when cache misses occur.
-        
+
         The method guarantees content freshness by validating file integrity
         (modification time and optionally content hash) before serving cached results.
         File-level locking prevents duplicate processing when multiple requests
         for the same file arrive concurrently.
-        
+
         Args:
             file_path: Path to the file whose content should be retrieved
             process_callback: Function that extracts content from the file.
                             Only called on cache misses. Should be idempotent.
-        
+
         Returns:
             CachedContent object containing the extracted content and metadata
             indicating whether it was served from cache
-        
+
         Raises:
             FileNotFoundError: If the file doesn't exist
             CachePermissionError: If file access is denied or path is invalid
@@ -167,38 +200,42 @@ class ContentCache:
             # Get a lock for this specific file to prevent duplicate processing
             file_lock = await self._get_file_lock(file_path)
 
-            async with file_lock:
-                # Try to get from memory cache
-                cached_content = await self._check_memory_cache(file_path)
-                if cached_content:
-                    collector.mark_cache_hit()
-                    return cached_content
+            try:
+                async with file_lock:
+                    # Try to get from memory cache
+                    cached_content = await self._check_memory_cache(file_path)
+                    if cached_content:
+                        collector.mark_cache_hit()
+                        return cached_content
 
-                # Try to get from persistent cache
-                cached_content = await self._check_persistent_cache(file_path)
-                if cached_content:
-                    collector.mark_cache_hit()
-                    return cached_content
+                    # Try to get from persistent cache
+                    cached_content = await self._check_persistent_cache(file_path)
+                    if cached_content:
+                        collector.mark_cache_hit()
+                        return cached_content
 
-                # Cache miss - process and cache the file
-                return await self._process_and_cache(file_path, process_callback)
+                    # Cache miss - process and cache the file
+                    return await self._process_and_cache(file_path, process_callback)
+            finally:
+                # Clean up lock after processing to prevent memory leak
+                await self._cleanup_file_lock(file_path)
 
     async def _get_file_lock(self, file_path: Path) -> asyncio.Lock:
         """
         Get or create a lock for the specific file.
-        
+
         Intent:
         Prevents duplicate processing when multiple concurrent requests arrive
         for the same file. Each file gets its own lock to avoid blocking unrelated
         operations. The lock manager itself is protected to prevent race conditions
         in lock creation.
-        
+
         This pattern is crucial for performance - without it, concurrent requests
         for uncached files would each trigger expensive processing operations.
-        
+
         Args:
             file_path: Path to get/create lock for
-            
+
         Returns:
             Asyncio lock specific to this file path
         """
@@ -207,23 +244,52 @@ class ContentCache:
                 self._processing_locks[file_path] = asyncio.Lock()
             return self._processing_locks[file_path]
 
+    async def _cleanup_file_lock(self, file_path: Path) -> None:
+        """
+        Remove lock for a file after processing completes.
+
+        Intent:
+        Prevents memory leak by removing locks that are no longer needed.
+        Only removes the lock if it's not currently in use (not locked),
+        which ensures we don't interfere with concurrent operations.
+
+        This cleanup happens after each file access completes, keeping the
+        lock dictionary size proportional to active concurrent operations
+        rather than total files ever processed.
+
+        Thread Safety:
+        Protected by _lock_manager to prevent TOCTOU issues. The lock check
+        and removal are atomic within the _lock_manager context.
+
+        Args:
+            file_path: Path to clean up lock for
+        """
+        async with self._lock_manager:
+            # Only remove if the lock exists and is not currently locked
+            # This check is safe because _lock_manager ensures atomicity
+            if file_path in self._processing_locks:
+                lock = self._processing_locks[file_path]
+                if not lock.locked():
+                    del self._processing_locks[file_path]
+                    logger.debug(f"[LOCK CLEANUP] Removed lock for {file_path} - Reason: No longer in use")
+
     async def _check_memory_cache(self, file_path: Path) -> Optional[CachedContent]:
         """
         Check memory cache for the file.
-        
+
         Intent:
         First tier lookup in the caching hierarchy. Memory cache provides
         sub-millisecond access times but limited capacity. This method performs
         integrity validation to ensure cached content is still valid before
         returning it.
-        
+
         The integrity check is crucial because files can be modified externally
         without the cache being notified. Rather than serving stale content,
         we validate and invalidate when necessary.
-        
+
         Args:
             file_path: Path to look up in memory cache
-            
+
         Returns:
             CachedContent if found and valid, None if not found or invalid
         """
@@ -232,7 +298,7 @@ class ContentCache:
             return None
 
         # Verify integrity
-        integrity_status = await self.integrity_checker.check_integrity(cached_entry)
+        integrity_status = await self._integrity_checker.check_integrity(cached_entry)
         if integrity_status == IntegrityStatus.VALID:
             # Check if we need to update modification time in memory cache
             current_stat = file_path.stat()
@@ -241,7 +307,7 @@ class ContentCache:
                 cached_entry.modification_time = current_stat.st_mtime
                 cached_entry.last_accessed = datetime.now()
                 # Note: Memory cache entry will be updated automatically since we're modifying the object
-            
+
             return CachedContent(
                 content=cached_entry.content,
                 from_cache=True,
@@ -254,29 +320,29 @@ class ContentCache:
     async def _check_persistent_cache(self, file_path: Path) -> Optional[CachedContent]:
         """
         Check persistent storage (SQLite + blob storage) for the file.
-        
+
         Intent:
         Second tier lookup that checks SQLite database and blob storage for
         cached content. This tier survives application restarts but has higher
         latency than memory cache. Large content is stored in compressed blobs
         to keep the SQLite database manageable.
-        
+
         On successful retrieval, content is promoted to memory cache for faster
         future access. This implements a natural heat-based promotion strategy
         where frequently accessed content stays in faster tiers.
-        
+
         Args:
             file_path: Path to look up in persistent storage
-            
+
         Returns:
             CachedContent if found and valid, None if not found or invalid
         """
-        cached_entry = await self.sqlite_storage.get(file_path)
+        cached_entry = await self._storage.get(file_path)
         if not cached_entry:
             return None
 
         # Verify integrity
-        integrity_status = await self.integrity_checker.check_integrity(cached_entry)
+        integrity_status = await self._integrity_checker.check_integrity(cached_entry)
         if integrity_status == IntegrityStatus.VALID:
             # Check if we need to update modification time
             current_stat = file_path.stat()
@@ -284,13 +350,13 @@ class ContentCache:
                 # File has newer mtime but same content - update cached mtime
                 cached_entry.modification_time = current_stat.st_mtime
                 cached_entry.last_accessed = datetime.now()
-                await self.sqlite_storage.add(cached_entry)  # Update in database
+                await self._storage.add(cached_entry)  # Update in database
         elif integrity_status != IntegrityStatus.VALID:
             return None
 
         # Load content from blob storage if needed
         if cached_entry.content_blob_path and not cached_entry.content:
-            content = await self.file_storage.retrieve(cached_entry.content_hash)
+            content = await self._blob_storage.retrieve(cached_entry.content_hash)
             if content:
                 cached_entry.content = content
 
@@ -310,16 +376,16 @@ class ContentCache:
     async def _add_to_memory_cache(self, entry: CacheEntry) -> None:
         """
         Add entry to memory cache.
-        
+
         Intent:
         Promotes content to the fastest cache tier for future access.
         Creates a new CacheEntry object to avoid sharing mutable state between
         cache tiers. The memory cache will handle LRU eviction automatically
         when capacity limits are reached.
-        
+
         This promotion strategy ensures frequently accessed content remains
         in the fastest tier while less popular content naturally ages out.
-        
+
         Args:
             entry: Cache entry to add to memory cache
         """
@@ -342,27 +408,27 @@ class ContentCache:
     ) -> CachedContent:
         """
         Process file and store in cache.
-        
+
         Intent:
         Handles cache misses by invoking the user-provided processing function
         and storing the results in appropriate cache tiers. This is the most
         expensive code path, so it's only executed when absolutely necessary.
-        
+
         The method captures file metadata (size, modification time) and computes
         content hash for future integrity checks. Content is stored in the most
         appropriate tier based on size - large content goes to blob storage to
         avoid bloating the SQLite database.
-        
+
         Args:
             file_path: Path to the file to process
             process_callback: User function that extracts content from the file
-            
+
         Returns:
             CachedContent with from_cache=False indicating fresh processing
         """
 
         # Compute file hash
-        file_hash = await self.integrity_checker._compute_file_hash(file_path)
+        file_hash = await self._integrity_checker.compute_file_hash(file_path)
 
         # Process content
         content = await process_callback(file_path)
@@ -394,29 +460,29 @@ class ContentCache:
     async def _store_in_cache(self, entry: CacheEntry, content: str) -> None:
         """
         Store entry in appropriate cache tiers.
-        
+
         Intent:
         Implements intelligent storage tier selection based on content size.
         Small content is stored directly in SQLite for fast access, while large
         content is compressed and stored as blobs with only metadata in SQLite.
-        
+
         This hybrid approach balances query performance (SQLite is fast for
         small content) with storage efficiency (compression helps with large
         content). All content under the threshold also gets promoted to memory
         cache for immediate future access.
-        
+
         Args:
             entry: Cache entry metadata
             content: Extracted content to store
         """
         # Store large content in file system
         if len(content) > SQLiteStorage.LARGE_CONTENT_THRESHOLD:
-            blob_path = await self.file_storage.store(entry.content_hash, content)
+            blob_path = await self._blob_storage.store(entry.content_hash, content)
             entry.content_blob_path = blob_path
             entry.content = None  # Don't store in SQLite
 
         # Store in SQLite
-        await self.sqlite_storage.add(entry)
+        await self._storage.add(entry)
 
         # Store in memory cache if small enough
         if len(content) <= SQLiteStorage.LARGE_CONTENT_THRESHOLD:
@@ -431,21 +497,21 @@ class ContentCache:
     ) -> list[CachedContent]:
         """
         Process multiple files efficiently with controlled concurrency.
-        
+
         Intent:
         Enables efficient batch processing while preventing resource exhaustion.
         Uses a semaphore to limit concurrent operations, preventing the system
         from being overwhelmed when processing large batches of files.
-        
+
         This is particularly important for file processing operations which can
         be I/O and CPU intensive. The concurrency limit allows tuning based on
         system capabilities and downstream service limits.
-        
+
         Args:
             file_paths: Sequence of file paths to process
             process_callback: Function to extract content from each file
             max_concurrent: Maximum number of concurrent processing operations
-            
+
         Returns:
             List of CachedContent objects in the same order as input paths
         """
@@ -463,45 +529,50 @@ class ContentCache:
     async def invalidate(self, file_path: Path) -> None:
         """
         Invalidate cache entry for a specific file.
-        
+
         Intent:
         Forcibly removes a file from all cache tiers when you know the content
         has changed or become invalid. This is useful for programmatic cache
         management when external processes modify files.
-        
+
         The method ensures complete cleanup by removing from memory cache,
         deleting any blob storage files, and removing SQLite records. This
         prevents storage leaks and ensures the next access will trigger
         fresh processing.
-        
+
         Args:
             file_path: Path of file to remove from cache
         """
+        logger.info(f"[CACHE INVALIDATE] Starting invalidation for {file_path}")
+
         # Remove from memory cache
         await self.memory_cache.remove(file_path)
+        logger.debug(f"[CACHE INVALIDATE] Removed {file_path} from memory cache")
 
         # Get entry to check for blob storage
-        entry = await self.sqlite_storage.get(file_path)
+        entry = await self._storage.get(file_path)
         if entry and entry.content_blob_path:
             # Delete blob file
-            await self.file_storage.delete(entry.content_hash)
+            await self._blob_storage.delete(entry.content_hash)
+            logger.debug(f"[CACHE INVALIDATE] Deleted blob {entry.content_hash} for {file_path}")
 
         # Remove from SQLite
-        await self.sqlite_storage.remove(file_path)
+        removed = await self._storage.remove(file_path)
+        logger.info(f"[CACHE INVALIDATE] Removed {file_path} from storage - Found: {removed}")
 
     async def invalidate_batch(self, file_paths: Sequence[Path]) -> int:
         """
         Invalidate multiple cache entries.
-        
+
         Intent:
         Efficiently removes multiple files from cache, useful for bulk operations
         like clearing cache for an entire directory. Processes invalidations
         concurrently for better performance while gracefully handling individual
         failures.
-        
+
         Args:
             file_paths: Sequence of file paths to invalidate
-            
+
         Returns:
             Number of entries invalidated (always equals input length)
         """
@@ -512,51 +583,55 @@ class ContentCache:
     async def clear_old_entries(self, days: int) -> int:
         """
         Clear entries not accessed within specified days.
-        
+
         Intent:
         Implements automatic cache cleanup based on access patterns rather than
         just creation time. This ensures frequently accessed content remains
         cached while stale content is removed to free storage space.
-        
+
         This is more intelligent than simple time-based expiration because it
         considers actual usage patterns. A file cached months ago but accessed
         yesterday is more valuable than a file cached yesterday but never accessed.
-        
+
         Args:
             days: Number of days since last access for cleanup threshold
-            
+
         Returns:
             Number of entries removed from cache
         """
+        logger.info(f"[CACHE CLEANUP] Starting cleanup of entries older than {days} days")
+
         # Clear from SQLite (this returns the count)
-        removed = await self.sqlite_storage.clear_old_entries(days)
+        removed = await self._storage.clear_old_entries(days)
+        logger.info(f"[CACHE CLEANUP] Removed {removed} entries from persistent storage - Reason: Not accessed in {days} days")
 
         # Clear from memory cache
         await self.memory_cache.clear()
+        logger.debug(f"[CACHE CLEANUP] Cleared memory cache")
 
         return removed
 
     async def get_statistics(self) -> dict:
         """
         Get comprehensive cache statistics.
-        
+
         Intent:
         Provides comprehensive metrics for cache performance monitoring and
         capacity planning. Calculates advanced metrics like duplicate detection
         (files with identical content) which helps understand storage efficiency.
-        
+
         The statistics help operators understand cache effectiveness, identify
         opportunities for optimization, and plan capacity requirements. Duplicate
         group detection reveals how much storage is saved through deduplication.
-        
+
         Returns:
             Dictionary containing cache performance and utilization metrics
         """
         # Get SQLite statistics
-        db_stats = await self.sqlite_storage.get_statistics()
+        db_stats = await self._storage.get_statistics()
 
         # Calculate duplicate groups
-        all_entries = await self.sqlite_storage.get_all()
+        all_entries = await self._storage.get_all()
         hash_groups = {}
         for entry in all_entries:
             if entry.content_hash not in hash_groups:
@@ -583,15 +658,15 @@ class ContentCache:
     def get_metrics_prometheus(self) -> str:
         """
         Get metrics in Prometheus format.
-        
+
         Intent:
         Exports cache metrics in Prometheus format for integration with
         monitoring systems. This enables alerting on cache performance issues,
         capacity problems, and trending analysis over time.
-        
+
         Prometheus format is the de facto standard for cloud-native monitoring,
         making it easy to integrate with existing observability infrastructure.
-        
+
         Returns:
             String containing metrics in Prometheus exposition format
         """
@@ -600,23 +675,23 @@ class ContentCache:
     def _validate_file_path(self, file_path: Path) -> None:
         """
         Validate file path for security - prevent path traversal attacks.
-        
+
         Intent:
         Implements security controls to prevent malicious file path manipulation.
         Path traversal attacks (../) could allow access to files outside intended
         directories, potentially exposing sensitive system files.
-        
+
         The validation includes:
         - Path traversal detection (".." sequences)
         - Path resolution to catch encoded traversals
         - Allowlist enforcement if configured
-        
+
         This is critical for any application that accepts user-provided file paths,
         as it prevents common file system security vulnerabilities.
-        
+
         Args:
             file_path: Path to validate
-            
+
         Raises:
             CachePermissionError: If path is invalid or access is denied
         """
@@ -644,15 +719,59 @@ class ContentCache:
     async def close(self) -> None:
         """
         Close all cache components.
-        
+
         Intent:
         Performs graceful shutdown of all cache components, ensuring data
         integrity and resource cleanup. This includes closing database connections,
         flushing any pending writes, and releasing system resources.
-        
+
         Should be called when the cache is no longer needed to prevent resource
         leaks and ensure data consistency. Safe to call multiple times.
         """
-        if self.sqlite_storage:
-            await self.sqlite_storage.close()
+        logger.info("[CACHE SHUTDOWN] Starting cache shutdown")
+
+        if self._storage:
+            await self._storage.close()
+            logger.debug("[CACHE SHUTDOWN] Closed storage connections")
+
+        # Clear lock references to prevent memory leaks
+        lock_count = len(self._processing_locks)
+        self._processing_locks.clear()
+        logger.debug(f"[CACHE SHUTDOWN] Cleared {lock_count} file locks - Reason: Shutdown")
+
+        logger.info("[CACHE SHUTDOWN] Cache shutdown complete")
+
+    async def __aenter__(self) -> "ContentCache":
+        """
+        Async context manager entry.
+
+        Intent:
+        Enables clean resource management with async context manager syntax.
+        Automatically initializes the cache when entering the context.
+
+        Example:
+            async with ContentCache() as cache:
+                result = await cache.get_content(path, processor)
+
+        Returns:
+            Self for use in context
+        """
+        await self.initialize()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """
+        Async context manager exit.
+
+        Intent:
+        Ensures proper cleanup when exiting the context, even if exceptions
+        occur. Automatically closes all storage connections and releases
+        resources.
+
+        Args:
+            exc_type: Exception type if an exception occurred
+            exc_val: Exception value if an exception occurred
+            exc_tb: Exception traceback if an exception occurred
+        """
+        await self.close()
 

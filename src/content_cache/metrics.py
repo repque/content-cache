@@ -11,18 +11,18 @@ from typing import Optional
 class CacheMetrics:
     """
     Comprehensive metrics for cache performance monitoring.
-    
+
     Intent:
     Provides detailed performance and operational metrics for cache monitoring,
     alerting, and optimization. Tracks both performance indicators (hit rates,
     response times) and operational metrics (storage usage, error rates).
-    
+
     Key design decisions:
     - Combines counters, gauges, and computed metrics for complete picture
     - Tracks error types separately for targeted troubleshooting
     - Provides both dict and Prometheus export formats for flexibility
     - Calculates derived metrics (hit rate, averages) on demand
-    
+
     These metrics enable:
     - Performance monitoring and alerting
     - Capacity planning and optimization
@@ -56,12 +56,12 @@ class CacheMetrics:
     def hit_rate(self) -> float:
         """
         Calculate cache hit rate.
-        
+
         Intent:
         Provides the most important cache performance metric - what percentage
         of requests are served from cache vs requiring expensive processing.
         This is a key indicator of cache effectiveness and configuration quality.
-        
+
         Returns:
             Hit rate as a decimal (0.0 to 1.0), 0.0 if no requests yet
         """
@@ -73,12 +73,12 @@ class CacheMetrics:
     def avg_response_time(self) -> float:
         """
         Calculate average response time.
-        
+
         Intent:
         Provides insight into overall cache performance by averaging response
         times across all requests. This includes both fast cache hits and
         slower cache misses, giving a realistic picture of user experience.
-        
+
         Returns:
             Average response time in seconds, 0.0 if no requests yet
         """
@@ -89,15 +89,15 @@ class CacheMetrics:
     def record_request(self, response_time: float, cache_hit: bool) -> None:
         """
         Record a single request.
-        
+
         Intent:
         Captures the essential metrics for each cache operation: timing and
         hit/miss status. Also maintains running statistics (min/max response
         times) for performance monitoring.
-        
+
         This method is called for every cache operation to build comprehensive
         performance statistics over time.
-        
+
         Args:
             response_time: Time taken to serve the request (seconds)
             cache_hit: Whether request was served from cache
@@ -119,12 +119,12 @@ class CacheMetrics:
     def record_error(self, error_type: str) -> None:
         """
         Record an error occurrence.
-        
+
         Intent:
         Tracks error patterns to help with troubleshooting and reliability
         monitoring. Grouping by error type enables targeted investigation
         and helps identify systemic issues vs random failures.
-        
+
         Args:
             error_type: Type of error that occurred (typically exception class name)
         """
@@ -133,12 +133,12 @@ class CacheMetrics:
     def to_dict(self) -> dict:
         """
         Convert metrics to dictionary for export.
-        
+
         Intent:
         Provides a structured data format suitable for JSON export, logging,
         or integration with monitoring systems. Converts raw metrics into
         human-readable units (milliseconds for time, megabytes for storage).
-        
+
         Returns:
             Dictionary containing all metrics in export-friendly format
         """
@@ -161,15 +161,15 @@ class CacheMetrics:
     def to_prometheus(self) -> str:
         """
         Export metrics in Prometheus format.
-        
+
         Intent:
         Enables integration with Prometheus monitoring systems using the
         standard exposition format. Includes proper metric types (counter,
         gauge, summary) and help text for operational clarity.
-        
+
         Prometheus format is the de facto standard for cloud-native monitoring,
         making this essential for production observability.
-        
+
         Returns:
             String in Prometheus exposition format
         """
@@ -214,12 +214,12 @@ class CacheMetrics:
     def reset(self) -> None:
         """
         Reset all metrics.
-        
+
         Intent:
         Provides a clean slate for metrics collection, useful for testing
         or when starting fresh measurement periods. Preserves the started_at
         timestamp while updating the reset timestamp.
-        
+
         Typically used in testing scenarios or for periodic metric reporting
         where you want to measure specific time windows.
         """
@@ -237,18 +237,18 @@ class CacheMetrics:
 class MetricsCollector:
     """
     Context manager for collecting request metrics.
-    
+
     Intent:
     Provides automatic timing and error tracking for cache operations using
     the context manager pattern. This ensures that all requests are properly
     measured without requiring manual instrumentation throughout the codebase.
-    
+
     Key benefits:
     - Automatic timing from entry to exit
     - Exception handling and error categorization
     - Clean separation of instrumentation from business logic
     - Guaranteed cleanup even when exceptions occur
-    
+
     Usage pattern enables consistent metrics collection across all cache
     operations with minimal code overhead.
     """
@@ -274,12 +274,12 @@ class MetricsCollector:
     def mark_cache_hit(self) -> None:
         """
         Mark this request as a cache hit.
-        
+
         Intent:
         Allows the cache logic to indicate when a request was served from cache
         rather than requiring expensive processing. This is called when cached
         content is found and validated.
-        
+
         The default assumption is cache miss (expensive operation), so this
         method is only called when we successfully serve from cache.
         """
