@@ -44,17 +44,16 @@ This guide shows developers how to integrate the content-file-cache into existin
 ### At a Glance: 3-Step Integration
 
 ```python
-# 1. Initialize cache (once at startup)
+# 1. Import
 from content_cache import ContentCache
-cache = ContentCache()
 
-# 2. Replace expensive operations
-# BEFORE: content = await expensive_llm_call(file_path)
-# AFTER:
-result = await cache.get_content(file_path, expensive_llm_call)
-
-# 3. Cleanup (at shutdown)
-await cache.close()
+# 2. Use context manager (handles init + cleanup automatically)
+async with ContentCache() as cache:
+    # 3. Replace expensive operations
+    # BEFORE: content = await expensive_llm_call(file_path)
+    # AFTER:
+    result = await cache.get_content(file_path, expensive_llm_call)
+    # Automatic cleanup on exit
 ```
 
 ### Migration Examples: Before & After
@@ -92,7 +91,6 @@ from pathlib import Path
 from content_cache import ContentCache  # 1. Import
 
 client = anthropic.Anthropic(api_key="your-key")
-cache = ContentCache()  # 2. Initialize
 
 async def extract_from_pdf(pdf_path: Path) -> str:
     """Your existing extraction logic - unchanged"""
@@ -106,12 +104,13 @@ async def extract_from_pdf(pdf_path: Path) -> str:
     return message.content[0].text
 
 async def process_invoices(pdf_files: list[Path]):
-    for pdf_path in pdf_files:
-        # 3. Use cache - first run processes, subsequent runs <1ms
-        result = await cache.get_content(pdf_path, extract_from_pdf)
-        print(f"Extracted: {result.content} (cached: {result.from_cache})")
-
-    await cache.close()  # 4. Cleanup
+    # 2. Use context manager (automatic init + cleanup)
+    async with ContentCache() as cache:
+        for pdf_path in pdf_files:
+            # 3. Use cache - first run processes, subsequent runs <1ms
+            result = await cache.get_content(pdf_path, extract_from_pdf)
+            print(f"Extracted: {result.content} (cached: {result.from_cache})")
+    # Automatic cleanup when exiting context
 ```
 
 **Benefits:**
@@ -157,13 +156,17 @@ cache = None
 @app.on_event("startup")
 async def startup():
     global cache
+    # Initialize cache (manual management for long-lived service)
     cache = ContentCache(config=CacheConfig(
         allowed_paths=[Path("./uploads")]  # Security
     ))
+    await cache.initialize()
 
 @app.on_event("shutdown")
 async def shutdown():
-    await cache.close()
+    # Explicit cleanup on service shutdown
+    if cache:
+        await cache.close()
 
 @app.post("/api/extract")
 async def extract_document(file: UploadFile):
@@ -208,7 +211,7 @@ def process_document(file_path: str):
 **AFTER (Shared Redis cache - no duplicate work):**
 ```python
 from celery import Celery
-from content_cache import ContentCache, CacheConfig
+from content_cache import ContentCache
 from content_cache.redis_storage import RedisStorage
 from redis.asyncio import Redis
 from pathlib import Path
@@ -219,14 +222,14 @@ app = Celery('tasks', broker='redis://localhost:6379/0')
 async def process_document(file_path: str):
     # Create cache with Redis backend (shared across workers)
     redis = Redis.from_url("redis://localhost:6379/0")
-    cache = ContentCache(storage=RedisStorage(redis))
 
-    # Worker 1 processes at 10:00 AM (cache miss)
-    # Worker 2 at 10:01 AM (cache hit - instant!)
-    result = await cache.get_content(Path(file_path), expensive_extraction)
-
-    await cache.close()
-    return result.content
+    # Use context manager for automatic cleanup
+    async with ContentCache(storage=RedisStorage(redis)) as cache:
+        # Worker 1 processes at 10:00 AM (cache miss)
+        # Worker 2 at 10:01 AM (cache hit - instant!)
+        result = await cache.get_content(Path(file_path), expensive_extraction)
+        return result.content
+    # Redis connection and cache automatically closed
 ```
 
 **Benefits:**
@@ -305,21 +308,28 @@ result = await cache.get_content(file_path, extract_with_claude)
 content = result.content
 ```
 
-#### Step 5: Add Resource Cleanup
+#### Step 5: Use Context Manager for Resource Management
 
-Ensure proper cleanup at shutdown:
+**Always use `async with` for automatic cleanup** (recommended):
 
 ```python
-# Context manager (preferred)
+# Best practice: Context manager handles init + cleanup
 async with ContentCache() as cache:
     result = await cache.get_content(file_path, processor)
+# Automatic cleanup on exit (even if exceptions occur)
+```
 
-# Or explicit cleanup
+**Only use manual cleanup for long-lived services**:
+
+```python
+# For services that run continuously (FastAPI, etc.)
 cache = ContentCache()
-try:
-    result = await cache.get_content(file_path, processor)
-finally:
-    await cache.close()
+await cache.initialize()
+
+# ... use cache across many requests ...
+
+# Cleanup on service shutdown
+await cache.close()
 ```
 
 ### Configuration Selection Guide
@@ -352,6 +362,8 @@ config = CacheConfig(
 
 ### Common Patterns
 
+**Note**: All patterns below use `async with` context manager for automatic resource management. This ensures proper initialization and cleanup, even when exceptions occur.
+
 #### Pattern 1: Service Class with Cache
 
 ```python
@@ -379,56 +391,51 @@ class DocumentService:
 
 ```python
 async def process_batch(files: list[Path]):
-    cache = ContentCache()
+    async with ContentCache() as cache:
+        for i, file_path in enumerate(files, 1):
+            result = await cache.get_content(file_path, processor)
 
-    for i, file_path in enumerate(files, 1):
-        result = await cache.get_content(file_path, processor)
+            status = "CACHED" if result.from_cache else "PROCESSED"
+            print(f"[{i}/{len(files)}] {file_path.name} - {status}")
 
-        status = "CACHED" if result.from_cache else "PROCESSED"
-        print(f"[{i}/{len(files)}] {file_path.name} - {status}")
-
-    # Show statistics
-    stats = await cache.get_statistics()
-    print(f"\nCache hit rate: {stats['hit_rate']:.1%}")
-    print(f"API calls saved: {stats['cache_hits']}")
-
-    await cache.close()
+        # Show statistics
+        stats = await cache.get_statistics()
+        print(f"\nCache hit rate: {stats['hit_rate']:.1%}")
+        print(f"API calls saved: {stats['cache_hits']}")
+    # Automatic cleanup
 ```
 
 #### Pattern 3: Error Handling and Fallback
 
 ```python
 async def robust_extraction(file_path: Path):
-    cache = ContentCache()
-
-    try:
-        result = await cache.get_content(file_path, expensive_processor)
-        return result.content
-    except CacheProcessingError as e:
-        # Processor failed - handle gracefully
-        logger.error(f"Processing failed: {e}")
-        return None
-    except CachePermissionError:
-        # File outside allowed paths
-        logger.warning(f"Access denied: {file_path}")
-        return None
-    finally:
-        await cache.close()
+    async with ContentCache() as cache:
+        try:
+            result = await cache.get_content(file_path, expensive_processor)
+            return result.content
+        except CacheProcessingError as e:
+            # Processor failed - handle gracefully
+            logger.error(f"Processing failed: {e}")
+            return None
+        except CachePermissionError:
+            # File outside allowed paths
+            logger.warning(f"Access denied: {file_path}")
+            return None
+    # Context manager ensures cleanup even if exceptions occur
 ```
 
 #### Pattern 4: Conditional Caching
 
 ```python
 async def smart_process(file_path: Path, force_refresh: bool = False):
-    cache = ContentCache()
+    async with ContentCache() as cache:
+        if force_refresh:
+            # Invalidate cache and reprocess
+            await cache.invalidate(file_path)
 
-    if force_refresh:
-        # Invalidate cache and reprocess
-        await cache.invalidate(file_path)
-
-    result = await cache.get_content(file_path, processor)
-    await cache.close()
-    return result.content
+        result = await cache.get_content(file_path, processor)
+        return result.content
+    # Automatic cleanup
 ```
 
 ### Quick Troubleshooting
