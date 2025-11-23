@@ -36,6 +36,463 @@ For the PDF processing examples with Anthropic's API, also install:
 ```bash
 pip install anthropic aiohttp aiofiles
 ```
+
+## Pipeline Integration Guide
+
+This guide shows developers how to integrate the content-file-cache into existing pipelines with minimal code changes.
+
+### At a Glance: 3-Step Integration
+
+```python
+# 1. Initialize cache (once at startup)
+from content_cache import ContentCache
+cache = ContentCache()
+
+# 2. Replace expensive operations
+# BEFORE: content = await expensive_llm_call(file_path)
+# AFTER:
+result = await cache.get_content(file_path, expensive_llm_call)
+
+# 3. Cleanup (at shutdown)
+await cache.close()
+```
+
+### Migration Examples: Before & After
+
+#### Pipeline Type 1: Document Processing with LLM APIs
+
+**Scenario**: You have a script that extracts data from PDFs using Claude API
+
+**BEFORE (Expensive - no caching):**
+```python
+import anthropic
+from pathlib import Path
+
+client = anthropic.Anthropic(api_key="your-key")
+
+async def process_invoices(pdf_files: list[Path]):
+    for pdf_path in pdf_files:
+        # Every run costs $0.075 per PDF
+        with open(pdf_path, 'rb') as f:
+            pdf_data = base64.b64encode(f.read()).decode()
+
+        message = client.messages.create(
+            model="claude-3-opus-20240229",
+            messages=[{"role": "user", "content": [...]}]
+        )
+
+        result = message.content[0].text
+        print(f"Extracted: {result}")
+```
+
+**AFTER (With caching - 3 line change):**
+```python
+import anthropic
+from pathlib import Path
+from content_cache import ContentCache  # 1. Import
+
+client = anthropic.Anthropic(api_key="your-key")
+cache = ContentCache()  # 2. Initialize
+
+async def extract_from_pdf(pdf_path: Path) -> str:
+    """Your existing extraction logic - unchanged"""
+    with open(pdf_path, 'rb') as f:
+        pdf_data = base64.b64encode(f.read()).decode()
+
+    message = client.messages.create(
+        model="claude-3-opus-20240229",
+        messages=[{"role": "user", "content": [...]}]
+    )
+    return message.content[0].text
+
+async def process_invoices(pdf_files: list[Path]):
+    for pdf_path in pdf_files:
+        # 3. Use cache - first run processes, subsequent runs <1ms
+        result = await cache.get_content(pdf_path, extract_from_pdf)
+        print(f"Extracted: {result.content} (cached: {result.from_cache})")
+
+    await cache.close()  # 4. Cleanup
+```
+
+**Benefits:**
+- First run: Same as before
+- Subsequent runs: Free, <1ms response
+- Processing 100 PDFs 50 times: $375 vs $18,750 without cache
+- File changes automatically trigger reprocessing
+
+#### Pipeline Type 2: FastAPI Web Service
+
+**Scenario**: API endpoint that processes uploaded documents
+
+**BEFORE (No caching):**
+```python
+from fastapi import FastAPI, UploadFile
+import shutil
+
+app = FastAPI()
+
+@app.post("/api/extract")
+async def extract_document(file: UploadFile):
+    # Save uploaded file
+    upload_path = f"./uploads/{file.filename}"
+    with open(upload_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # Process every time - even for same file
+    content = await expensive_extraction(Path(upload_path))
+
+    return {"content": content}
+```
+
+**AFTER (With caching):**
+```python
+from fastapi import FastAPI, UploadFile
+from content_cache import ContentCache, CacheConfig
+from pathlib import Path
+import shutil
+
+app = FastAPI()
+cache = None
+
+@app.on_event("startup")
+async def startup():
+    global cache
+    cache = ContentCache(config=CacheConfig(
+        allowed_paths=[Path("./uploads")]  # Security
+    ))
+
+@app.on_event("shutdown")
+async def shutdown():
+    await cache.close()
+
+@app.post("/api/extract")
+async def extract_document(file: UploadFile):
+    upload_path = Path(f"./uploads/{file.filename}")
+    with open(upload_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # Cache handles deduplication across users
+    result = await cache.get_content(upload_path, expensive_extraction)
+
+    return {
+        "content": result.content,
+        "from_cache": result.from_cache,
+        "cost_saved": result.from_cache  # True = $0.075 saved
+    }
+```
+
+**Benefits:**
+- Multiple users uploading same document: Process once
+- Re-uploads of same file: Instant response from cache
+- Development testing: No API charges after first run
+- Security: `allowed_paths` prevents directory traversal
+
+#### Pipeline Type 3: Distributed Task Queue (Celery with Redis)
+
+**Scenario**: Multiple Celery workers processing documents
+
+**BEFORE (Each worker processes independently):**
+```python
+from celery import Celery
+
+app = Celery('tasks', broker='redis://localhost:6379/0')
+
+@app.task
+def process_document(file_path: str):
+    # Worker 1 processes doc.pdf at 10:00 AM
+    # Worker 2 processes same doc.pdf at 10:01 AM (duplicate work!)
+    result = expensive_extraction(Path(file_path))
+    return result
+```
+
+**AFTER (Shared Redis cache - no duplicate work):**
+```python
+from celery import Celery
+from content_cache import ContentCache, CacheConfig
+from content_cache.redis_storage import RedisStorage
+from redis.asyncio import Redis
+from pathlib import Path
+
+app = Celery('tasks', broker='redis://localhost:6379/0')
+
+@app.task
+async def process_document(file_path: str):
+    # Create cache with Redis backend (shared across workers)
+    redis = Redis.from_url("redis://localhost:6379/0")
+    cache = ContentCache(storage=RedisStorage(redis))
+
+    # Worker 1 processes at 10:00 AM (cache miss)
+    # Worker 2 at 10:01 AM (cache hit - instant!)
+    result = await cache.get_content(Path(file_path), expensive_extraction)
+
+    await cache.close()
+    return result.content
+```
+
+**Benefits:**
+- Workers share cache: No duplicate API calls
+- Distributed deduplication: Same file processed once across all workers
+- Cost savings scale with worker count
+- Persistent cache: Survives worker restarts
+
+### Step-by-Step Integration Workflow
+
+#### Step 1: Identify Expensive Operations
+
+Look for operations that should be cached:
+- LLM API calls (Claude, GPT-4, etc.) - $0.01-$0.10 per request
+- OCR services (Textract, Vision) - $0.001-$0.05 per page
+- Document parsing with external APIs
+- Any per-file processing cost
+
+#### Step 2: Extract Processor Function
+
+Create a standalone async function for your expensive operation:
+
+```python
+# Your existing inline code:
+content = client.messages.create(model="...", messages=[...])
+
+# Extract to function:
+async def extract_with_claude(file_path: Path) -> str:
+    """Expensive Claude API call - will be cached."""
+    with open(file_path, 'rb') as f:
+        data = base64.b64encode(f.read()).decode()
+
+    message = client.messages.create(
+        model="claude-3-opus-20240229",
+        messages=[{"role": "user", "content": [...]}]
+    )
+    return message.content[0].text
+```
+
+#### Step 3: Choose Storage Backend
+
+**Use SQLite (default)** for:
+- Single-process applications
+- CLI tools
+- Development environments
+- Single web server instances
+
+```python
+cache = ContentCache()  # Simple!
+```
+
+**Use Redis** for:
+- Multi-worker deployments (Celery, Ray)
+- Multiple server instances
+- Distributed systems
+- Shared cache across processes
+
+```python
+from redis.asyncio import Redis
+from content_cache.redis_storage import RedisStorage
+
+redis = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+cache = ContentCache(storage=RedisStorage(redis))
+```
+
+#### Step 4: Integrate Cache Calls
+
+Replace direct function calls with cache-wrapped calls:
+
+```python
+# BEFORE: Direct call
+content = await extract_with_claude(file_path)
+
+# AFTER: Cache-wrapped
+result = await cache.get_content(file_path, extract_with_claude)
+content = result.content
+```
+
+#### Step 5: Add Resource Cleanup
+
+Ensure proper cleanup at shutdown:
+
+```python
+# Context manager (preferred)
+async with ContentCache() as cache:
+    result = await cache.get_content(file_path, processor)
+
+# Or explicit cleanup
+cache = ContentCache()
+try:
+    result = await cache.get_content(file_path, processor)
+finally:
+    await cache.close()
+```
+
+### Configuration Selection Guide
+
+**Minimal Configuration (Good for most cases):**
+```python
+cache = ContentCache()  # Uses sensible defaults
+```
+
+**Production Configuration:**
+```python
+config = CacheConfig(
+    cache_dir=Path("./cache_storage"),
+    max_memory_size=500 * 1024 * 1024,  # 500MB
+    verify_hash=True,                    # Data integrity
+    allowed_paths=[Path("/safe/uploads")],  # Security
+    compression_level=6,                 # Balance speed/size
+)
+cache = ContentCache(config=config)
+```
+
+**High-Concurrency Configuration:**
+```python
+config = CacheConfig(
+    db_pool_size=20,  # More concurrent DB connections
+    max_memory_size=1024 * 1024 * 1024,  # 1GB memory cache
+    bloom_filter_size=10000000,  # Large filter for better perf
+)
+```
+
+### Common Patterns
+
+#### Pattern 1: Service Class with Cache
+
+```python
+class DocumentService:
+    def __init__(self, use_redis: bool = False):
+        if use_redis:
+            redis = Redis.from_url(os.getenv("REDIS_URL"))
+            self.cache = ContentCache(storage=RedisStorage(redis))
+        else:
+            self.cache = ContentCache()
+
+    async def process(self, file_path: Path) -> str:
+        result = await self.cache.get_content(file_path, self._extract)
+        return result.content
+
+    async def _extract(self, file_path: Path) -> str:
+        # Your extraction logic
+        pass
+
+    async def close(self):
+        await self.cache.close()
+```
+
+#### Pattern 2: Batch Processing with Progress Tracking
+
+```python
+async def process_batch(files: list[Path]):
+    cache = ContentCache()
+
+    for i, file_path in enumerate(files, 1):
+        result = await cache.get_content(file_path, processor)
+
+        status = "CACHED" if result.from_cache else "PROCESSED"
+        print(f"[{i}/{len(files)}] {file_path.name} - {status}")
+
+    # Show statistics
+    stats = await cache.get_statistics()
+    print(f"\nCache hit rate: {stats['hit_rate']:.1%}")
+    print(f"API calls saved: {stats['cache_hits']}")
+
+    await cache.close()
+```
+
+#### Pattern 3: Error Handling and Fallback
+
+```python
+async def robust_extraction(file_path: Path):
+    cache = ContentCache()
+
+    try:
+        result = await cache.get_content(file_path, expensive_processor)
+        return result.content
+    except CacheProcessingError as e:
+        # Processor failed - handle gracefully
+        logger.error(f"Processing failed: {e}")
+        return None
+    except CachePermissionError:
+        # File outside allowed paths
+        logger.warning(f"Access denied: {file_path}")
+        return None
+    finally:
+        await cache.close()
+```
+
+#### Pattern 4: Conditional Caching
+
+```python
+async def smart_process(file_path: Path, force_refresh: bool = False):
+    cache = ContentCache()
+
+    if force_refresh:
+        # Invalidate cache and reprocess
+        await cache.invalidate(file_path)
+
+    result = await cache.get_content(file_path, processor)
+    await cache.close()
+    return result.content
+```
+
+### Quick Troubleshooting
+
+**Issue**: "Cache always misses even for unchanged files"
+```python
+# Solution: Ensure file_path is consistent (absolute vs relative)
+file_path = Path("doc.pdf").resolve()  # Use absolute path
+```
+
+**Issue**: "Permission denied errors"
+```python
+# Solution: Add file location to allowed_paths
+config = CacheConfig(
+    allowed_paths=[Path("/your/upload/directory")]
+)
+```
+
+**Issue**: "High memory usage"
+```python
+# Solution: Reduce memory cache size
+config = CacheConfig(
+    max_memory_size=50 * 1024 * 1024  # 50MB instead of default 100MB
+)
+```
+
+**Issue**: "Redis connection errors in multi-worker setup"
+```python
+# Solution: Use connection pooling
+redis = Redis.from_url(
+    "redis://localhost:6379/0",
+    max_connections=50  # Pool for multiple workers
+)
+```
+
+### Next Steps
+
+Once integrated, consider:
+
+1. **Monitor Performance**: Track cache hit rates
+```python
+stats = await cache.get_statistics()
+logger.info(f"Cache efficiency: {stats['hit_rate']:.1%}")
+```
+
+2. **Set Up Metrics**: Export to Prometheus
+```python
+metrics = cache.get_metrics_prometheus()
+# Push to monitoring system
+```
+
+3. **Schedule Cleanup**: Remove stale entries
+```python
+# Remove entries not accessed in 30 days
+removed = await cache.clear_old_entries(days=30)
+```
+
+4. **Security Review**: Validate allowed paths
+```python
+config = CacheConfig(
+    allowed_paths=[Path("/safe/uploads")],  # Whitelist only
+)
+```
+
 ## Simple Usage
 
 For basic usage without downloads:
